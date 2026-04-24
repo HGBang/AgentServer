@@ -4,20 +4,25 @@ using System.Diagnostics;
 namespace AgentServer.Services;
 
 /// <summary>
-/// Lobby DS / Game DS 프로세스를 실행/관리하는 서비스.
-/// - Lobby DS: 서버 시작 시 자동 실행, 로그인 성공 시 접속 정보 제공
+/// Lobby DS (다중 인스턴스 풀) / Game DS 프로세스를 실행/관리하는 서비스.
+/// - Lobby DS: 인원 초과 시 자동 확장, 여유 있는 로비로 배정
 /// - Game DS: 방에서 게임 시작 시 실행
 /// </summary>
 public class DedicatedServerLauncher : IDisposable
 {
     private readonly IConfiguration _configuration;
     private readonly ILogger<DedicatedServerLauncher> _logger;
-    private int _nextGamePort;
+    private readonly object _lobbyLock = new();
 
-    // Lobby DS 정보
-    private Process? _lobbyProcess;
-    private int _lobbyPort;
-    private bool _lobbyReady;
+    private int _nextLobbyPort;
+    private int _nextGamePort;
+    private int _lobbyIdCounter;
+
+    // Lobby DS 풀: lobbyId -> LobbyInstance
+    private readonly ConcurrentDictionary<string, LobbyInstance> _lobbyServers = new();
+
+    // 유저가 어느 로비에 배정됐는지: userId -> lobbyId
+    private readonly ConcurrentDictionary<string, string> _userLobbyMap = new();
 
     // Game DS 관리: roomId -> (process, port)
     private readonly ConcurrentDictionary<string, (Process process, int port)> _gameServers = new();
@@ -26,76 +31,191 @@ public class DedicatedServerLauncher : IDisposable
     {
         _configuration = configuration;
         _logger = logger;
-        _nextGamePort = _configuration.GetValue("DedicatedServer:Game:StartPort", 7787);
+        _nextLobbyPort = _configuration.GetValue("DedicatedServer:Lobby:StartPort", 7777);
+        _nextGamePort = _configuration.GetValue("DedicatedServer:Game:StartPort", 7877);
     }
 
     // ─────────────────────────────────────────
-    // Lobby DS
+    // Lobby DS 풀
     // ─────────────────────────────────────────
 
-    public bool IsLobbyReady => _lobbyReady && _lobbyProcess is { HasExited: false };
-
-    public int LobbyPort => _lobbyPort;
-
     public string LobbyIp => _configuration.GetValue<string>("DedicatedServer:Lobby:Ip") ?? "127.0.0.1";
+    public int MaxPlayersPerLobby => _configuration.GetValue("DedicatedServer:Lobby:MaxPlayers", 100);
 
-    public bool LaunchLobbyServer()
+    public bool HasAvailableLobby => _lobbyServers.Values.Any(l => l.IsAlive && l.CurrentPlayers < MaxPlayersPerLobby);
+
+    /// <summary>
+    /// 서버 시작 시 첫 로비 DS를 실행한다.
+    /// </summary>
+    public bool LaunchInitialLobby()
     {
-        if (IsLobbyReady)
-        {
-            _logger.LogInformation("Lobby DS is already running on port {Port}", _lobbyPort);
-            return true;
-        }
+        var lobby = LaunchNewLobbyInstance();
+        return lobby != null;
+    }
 
+    /// <summary>
+    /// 유저를 여유 있는 로비에 배정한다.
+    /// 모든 로비가 가득 차면 새 로비를 자동 생성한다.
+    /// </summary>
+    public LobbyInstance? AssignUserToLobby(string userId)
+    {
+        lock (_lobbyLock)
+        {
+            // 이미 배정된 유저면 기존 로비 반환
+            if (_userLobbyMap.TryGetValue(userId, out var existingLobbyId))
+            {
+                if (_lobbyServers.TryGetValue(existingLobbyId, out var existing) && existing.IsAlive)
+                {
+                    return existing;
+                }
+                // 죽은 로비면 제거
+                _userLobbyMap.TryRemove(userId, out _);
+            }
+
+            // 여유 있는 로비 찾기 (인원 적은 순)
+            var available = _lobbyServers.Values
+                .Where(l => l.IsAlive && l.CurrentPlayers < MaxPlayersPerLobby)
+                .OrderBy(l => l.CurrentPlayers)
+                .FirstOrDefault();
+
+            // 없으면 새 로비 생성
+            if (available == null)
+            {
+                _logger.LogInformation("All lobby servers full. Launching new lobby instance...");
+                available = LaunchNewLobbyInstance();
+
+                if (available == null)
+                {
+                    _logger.LogError("Failed to launch new lobby instance");
+                    return null;
+                }
+            }
+
+            // 배정
+            available.CurrentPlayers++;
+            _userLobbyMap[userId] = available.LobbyId;
+
+            _logger.LogInformation(
+                "User {UserId} assigned to Lobby {LobbyId} (Port:{Port}, Players:{Current}/{Max})",
+                userId, available.LobbyId, available.Port, available.CurrentPlayers, MaxPlayersPerLobby);
+
+            return available;
+        }
+    }
+
+    /// <summary>
+    /// 유저가 로비에서 나갈 때 (로그아웃 또는 게임 DS로 이동).
+    /// </summary>
+    public void RemoveUserFromLobby(string userId)
+    {
+        lock (_lobbyLock)
+        {
+            if (_userLobbyMap.TryRemove(userId, out var lobbyId))
+            {
+                if (_lobbyServers.TryGetValue(lobbyId, out var lobby))
+                {
+                    lobby.CurrentPlayers = Math.Max(0, lobby.CurrentPlayers - 1);
+
+                    _logger.LogInformation(
+                        "User {UserId} removed from Lobby {LobbyId} (Players:{Current}/{Max})",
+                        userId, lobbyId, lobby.CurrentPlayers, MaxPlayersPerLobby);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 새 로비 DS 인스턴스를 실행한다.
+    /// </summary>
+    private LobbyInstance? LaunchNewLobbyInstance()
+    {
         var exePath = _configuration.GetValue<string>("DedicatedServer:Lobby:ExePath");
         var mapName = _configuration.GetValue<string>("DedicatedServer:Lobby:MapName") ?? "/Game/Maps/Lobby";
-        _lobbyPort = _configuration.GetValue("DedicatedServer:Lobby:Port", 7777);
         var additionalArgs = _configuration.GetValue<string>("DedicatedServer:Lobby:AdditionalArgs") ?? "";
 
         if (string.IsNullOrEmpty(exePath))
         {
             _logger.LogError("DedicatedServer:Lobby:ExePath is not configured");
-            return false;
+            return null;
         }
 
         if (!File.Exists(exePath))
         {
             _logger.LogError("Lobby DS exe not found: {ExePath}", exePath);
-            return false;
+            return null;
         }
 
-        var arguments = $"{mapName} -server -log -port={_lobbyPort} {additionalArgs}";
+        var port = Interlocked.Increment(ref _nextLobbyPort);
+        var lobbyId = $"Lobby_{Interlocked.Increment(ref _lobbyIdCounter)}";
+        var arguments = $"{mapName} -server -log -port={port} -LobbyId={lobbyId} {additionalArgs}";
 
-        _logger.LogInformation("Launching Lobby DS: {ExePath} {Args}", exePath, arguments);
+        _logger.LogInformation("Launching Lobby DS [{LobbyId}]: {ExePath} {Args}", lobbyId, exePath, arguments);
 
         try
         {
-            _lobbyProcess = LaunchProcess(exePath, arguments, "LOBBY");
+            var process = LaunchProcess(exePath, arguments, lobbyId);
 
-            if (_lobbyProcess != null)
+            if (process != null)
             {
-                _lobbyReady = true;
-                _logger.LogInformation("Lobby DS started: PID={Pid}, Port={Port}",
-                    _lobbyProcess.Id, _lobbyPort);
-                return true;
+                var lobby = new LobbyInstance
+                {
+                    LobbyId = lobbyId,
+                    Process = process,
+                    Port = port,
+                    CurrentPlayers = 0
+                };
+
+                _lobbyServers[lobbyId] = lobby;
+
+                _logger.LogInformation("Lobby DS [{LobbyId}] started: PID={Pid}, Port={Port}",
+                    lobbyId, process.Id, port);
+
+                return lobby;
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to launch Lobby DS");
+            _logger.LogError(ex, "Failed to launch Lobby DS [{LobbyId}]", lobbyId);
         }
 
-        return false;
+        return null;
     }
 
-    public void StopLobbyServer()
+    public void StopLobbyServer(string lobbyId)
     {
-        if (_lobbyProcess != null)
+        if (_lobbyServers.TryRemove(lobbyId, out var lobby))
         {
-            StopProcess(_lobbyProcess, "LOBBY");
-            _lobbyProcess = null;
-            _lobbyReady = false;
+            StopProcess(lobby.Process, lobbyId);
+
+            // 해당 로비에 배정된 유저 정리
+            var usersToRemove = _userLobbyMap
+                .Where(kv => kv.Value == lobbyId)
+                .Select(kv => kv.Key)
+                .ToList();
+            foreach (var uid in usersToRemove)
+            {
+                _userLobbyMap.TryRemove(uid, out _);
+            }
         }
+    }
+
+    public void StopAllLobbyServers()
+    {
+        foreach (var lobbyId in _lobbyServers.Keys.ToList())
+        {
+            StopLobbyServer(lobbyId);
+        }
+    }
+
+    /// <summary>
+    /// 현재 로비 현황 조회.
+    /// </summary>
+    public List<LobbyInstance> GetLobbyStatus()
+    {
+        return _lobbyServers.Values
+            .Where(l => l.IsAlive)
+            .OrderBy(l => l.Port)
+            .ToList();
     }
 
     // ─────────────────────────────────────────
@@ -214,29 +334,24 @@ public class DedicatedServerLauncher : IDisposable
         }
     }
 
-    public void StopServer(int pid)
-    {
-        try
-        {
-            var process = Process.GetProcessById(pid);
-            if (!process.HasExited)
-            {
-                process.Kill(entireProcessTree: true);
-                _logger.LogInformation("DedicatedServer stopped: PID={Pid}", pid);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Could not stop DedicatedServer PID={Pid}", pid);
-        }
-    }
-
     public void Dispose()
     {
-        StopLobbyServer();
+        StopAllLobbyServers();
         foreach (var roomId in _gameServers.Keys.ToList())
         {
             StopGameServer(roomId);
         }
     }
+}
+
+/// <summary>
+/// 로비 DS 인스턴스 정보.
+/// </summary>
+public class LobbyInstance
+{
+    public string LobbyId { get; set; } = string.Empty;
+    public Process Process { get; set; } = null!;
+    public int Port { get; set; }
+    public int CurrentPlayers { get; set; }
+    public bool IsAlive => Process is { HasExited: false };
 }

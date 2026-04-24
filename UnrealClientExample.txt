@@ -1,22 +1,27 @@
 =====================================
   AgentServer - Unreal Engine 연동 예시
-  (Lobby DS + Game DS 2단 구조)
+  (Lobby DS 풀 + Game DS 2단 구조)
 =====================================
 
 
 ■ 전체 흐름
 --------------------------------------
-[Client UE]                  [AgentServer C#]           [Lobby DS (UE)]        [Game DS (UE)]
+[Client UE]                  [AgentServer C#]           [Lobby DS Pool]        [Game DS (UE)]
+    |                              |                    [Lobby_1 :7778]              |
+    |                              |                    [Lobby_2 :7779]              |
+    |                              |                    [Lobby_N :자동]              |
     |                              |                         |                      |
     +-- 1. WebSocket 연결 --------→|                         |                      |
     +-- 2. SendLogin -------------→|                         |                      |
     |                              +-- 인증/검증              |                      |
+    |                              +-- 여유 로비 배정          |                      |
+    |                              |   (가득차면 새 로비 생성) |                      |
     |←- 3. login_result -----------|                         |                      |
-    |      (lobbyIp, lobbyPort)    |                         |                      |
+    |      (lobbyIp, lobbyPort,    |                         |                      |
+    |       lobbyId)               |                         |                      |
     |                              |                         |                      |
-    +-- 4. ClientTravel -----------------------------------→| (로비 DS 접속)       |
+    +-- 4. ClientTravel -----------------------------------→| (배정된 로비 접속)    |
     |      로비 월드에서 플레이     |                         |                      |
-    |      (방 목록, 채팅, 캐릭터)  |                         |                      |
     |                              |                         |                      |
     +-- 5. SendCreateRoom --------→| → Room DB 저장          |                      |
     +-- 6. SendStartGame ---------→| → Game DS 실행 ------→  |                  →  | (프로세스 시작)
@@ -25,6 +30,16 @@
     |                              |                         |                      |
     +-- 8. ClientTravel -------------------------------------------------------→   | (게임 DS 접속)
     |      게임 플레이 (UE Replication)                                              |
+
+
+■ 로비 자동 확장 동작
+--------------------------------------
+1. AgentServer 시작 -> Lobby_1 자동 실행 (Port:7778)
+2. 유저 로그인 -> Lobby_1에 배정 (인원 적은 로비 우선)
+3. Lobby_1 인원이 MaxPlayers(100)에 도달
+4. 다음 유저 로그인 -> Lobby_2 자동 생성 (Port:7779) -> 배정
+5. 유저 로그아웃 시 해당 로비 인원 차감
+6. http://localhost:5000/api/lobbies 에서 로비 현황 실시간 조회
 
 
 ■ Build.cs 모듈 추가
@@ -247,19 +262,20 @@ void UAgentServerComponent::OnWsMessage(const FString& Message)
 
     FString Type = Json->GetStringField(TEXT("type"));
 
-    // ── login_result: 로비 DS 접속 정보 포함 ──
+    // ── login_result: 배정된 로비 DS 접속 정보 포함 ──
     if (Type == TEXT("login_result"))
     {
         bool bSuccess = Json->GetBoolField(TEXT("success"));
         FString UserId = Json->HasField(TEXT("userId")) ? Json->GetStringField(TEXT("userId")) : TEXT("");
         FString LobbyIp = Json->HasField(TEXT("lobbyServerIp")) ? Json->GetStringField(TEXT("lobbyServerIp")) : TEXT("");
         int32 LobbyPort = Json->HasField(TEXT("lobbyServerPort")) ? Json->GetIntegerField(TEXT("lobbyServerPort")) : 0;
+        FString LobbyId = Json->HasField(TEXT("lobbyId")) ? Json->GetStringField(TEXT("lobbyId")) : TEXT("");
 
         OnLoginResult.Broadcast(bSuccess, UserId, LobbyIp, LobbyPort);
 
         if (bSuccess)
         {
-            UE_LOG(LogTemp, Log, TEXT("[AgentServer] Login OK -> Lobby DS at %s:%d"), *LobbyIp, LobbyPort);
+            UE_LOG(LogTemp, Log, TEXT("[AgentServer] Login OK -> %s at %s:%d"), *LobbyId, *LobbyIp, LobbyPort);
         }
     }
     // ── chat_message ──
@@ -522,12 +538,13 @@ GI->AgentServer->SendStartGame(TEXT("abc123"));
       "ExePath": "C:/UnrealProject/Binaries/Win64/MyGameServer.exe",
       "MapName": "/Game/Maps/Lobby",
       "Ip": "127.0.0.1",
-      "Port": 7777,
+      "StartPort": 7777,
+      "MaxPlayers": 100,
       "AdditionalArgs": "-nosteam"
     },
     "Game": {
       "ExePath": "C:/UnrealProject/Binaries/Win64/MyGameServer.exe",
-      "StartPort": 7787,
+      "StartPort": 7877,
       "AdditionalArgs": "-nosteam"
     }
   }
@@ -535,3 +552,10 @@ GI->AgentServer->SendStartGame(TEXT("abc123"));
 
 ※ Lobby와 Game이 같은 exe를 쓸 수도 있고,
   별도 빌드로 분리할 수도 있음 (MapName으로 구분)
+
+※ MaxPlayers: 로비 1개당 최대 인원. 초과 시 자동으로 새 로비 생성
+※ StartPort: 로비/게임 DS가 순차적으로 포트를 할당받음
+   Lobby: 7778, 7779, 7780, ...
+   Game:  7878, 7879, 7880, ...
+
+※ 로비 현황 API: http://localhost:5000/api/lobbies

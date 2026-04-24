@@ -108,8 +108,10 @@ public class WebSocketHandler
                 _connections.AddConnection(req.UserId, webSocket);
                 currentUserId = req.UserId;
 
-                // 로비 DS가 실행 중인지 확인
-                if (_dsLauncher.IsLobbyReady)
+                // 여유 있는 로비 DS에 배정
+                var lobby = _dsLauncher.AssignUserToLobby(req.UserId);
+
+                if (lobby != null)
                 {
                     await _broadcaster.SendToUser(req.UserId, new
                     {
@@ -118,7 +120,8 @@ public class WebSocketHandler
                         userId = user.UserId,
                         displayName = user.DisplayName,
                         lobbyServerIp = _dsLauncher.LobbyIp,
-                        lobbyServerPort = _dsLauncher.LobbyPort
+                        lobbyServerPort = lobby.Port,
+                        lobbyId = lobby.LobbyId
                     });
                 }
                 else
@@ -127,7 +130,7 @@ public class WebSocketHandler
                     {
                         type = "login_result",
                         success = false,
-                        error = "Lobby server is not available"
+                        error = "No lobby server available"
                     });
                 }
 
@@ -392,6 +395,9 @@ public class WebSocketHandler
             await _gameLogger.LogRoomEvent("DISCONNECT_LEAVE", roomId, userId,
                 dcUser?.DisplayName ?? userId);
         }
+
+        // 로비 인원 차감
+        _dsLauncher.RemoveUserFromLobby(userId);
 
         await _userService.SetOffline(userId);
         _connections.RemoveConnection(userId);

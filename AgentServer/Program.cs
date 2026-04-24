@@ -60,35 +60,54 @@ app.Map("/ws", async (HttpContext context) =>
 });
 
 // ── Health Check / Status API ──
-app.MapGet("/", (ConnectionManager cm) => new
+app.MapGet("/", (ConnectionManager cm, DedicatedServerLauncher ds) => new
 {
     server = "AgentServer",
     status = "running",
     connections = cm.ConnectionCount,
+    lobbies = ds.GetLobbyStatus().Select(l => new
+    {
+        lobbyId = l.LobbyId,
+        port = l.Port,
+        players = l.CurrentPlayers,
+        maxPlayers = ds.MaxPlayersPerLobby,
+        alive = l.IsAlive
+    }),
     timestamp = DateTime.UtcNow
 });
 
-app.MapGet("/api/status", (ConnectionManager cm) => new
+app.MapGet("/api/lobbies", (DedicatedServerLauncher ds) => new
 {
-    connections = cm.ConnectionCount,
-    uptime = DateTime.UtcNow
+    lobbies = ds.GetLobbyStatus().Select(l => new
+    {
+        lobbyId = l.LobbyId,
+        port = l.Port,
+        players = l.CurrentPlayers,
+        maxPlayers = ds.MaxPlayersPerLobby,
+        alive = l.IsAlive
+    })
 });
 
 var port = builder.Configuration.GetValue("ServerPort", 5000);
 app.Urls.Add($"http://0.0.0.0:{port}");
 
-// ── Lobby DS 자동 실행 ──
+// ── 첫 번째 Lobby DS 자동 실행 ──
 var dsLauncher = app.Services.GetRequiredService<DedicatedServerLauncher>();
-var lobbyLaunched = dsLauncher.LaunchLobbyServer();
+var lobbyLaunched = dsLauncher.LaunchInitialLobby();
 
 Console.WriteLine($"===========================================");
 Console.WriteLine($"  AgentServer started on port {port}");
 Console.WriteLine($"  WebSocket: ws://localhost:{port}/ws");
 Console.WriteLine($"  Status:    http://localhost:{port}/");
+Console.WriteLine($"  Lobbies:   http://localhost:{port}/api/lobbies");
 Console.WriteLine($"-------------------------------------------");
 if (lobbyLaunched)
 {
-    Console.WriteLine($"  Lobby DS:  {dsLauncher.LobbyIp}:{dsLauncher.LobbyPort}");
+    var lobbies = dsLauncher.GetLobbyStatus();
+    foreach (var lobby in lobbies)
+    {
+        Console.WriteLine($"  Lobby [{lobby.LobbyId}]: {dsLauncher.LobbyIp}:{lobby.Port} (Max:{dsLauncher.MaxPlayersPerLobby})");
+    }
 }
 else
 {
