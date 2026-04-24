@@ -77,10 +77,31 @@ app.MapGet("/api/status", (ConnectionManager cm) => new
 var port = builder.Configuration.GetValue("ServerPort", 5000);
 app.Urls.Add($"http://0.0.0.0:{port}");
 
+// ── Lobby DS 자동 실행 ──
+var dsLauncher = app.Services.GetRequiredService<DedicatedServerLauncher>();
+var lobbyLaunched = dsLauncher.LaunchLobbyServer();
+
 Console.WriteLine($"===========================================");
 Console.WriteLine($"  AgentServer started on port {port}");
 Console.WriteLine($"  WebSocket: ws://localhost:{port}/ws");
 Console.WriteLine($"  Status:    http://localhost:{port}/");
+Console.WriteLine($"-------------------------------------------");
+if (lobbyLaunched)
+{
+    Console.WriteLine($"  Lobby DS:  {dsLauncher.LobbyIp}:{dsLauncher.LobbyPort}");
+}
+else
+{
+    Console.WriteLine($"  Lobby DS:  NOT RUNNING (check config)");
+}
 Console.WriteLine($"===========================================");
+
+// ── 종료 시 DS 정리 ──
+var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+lifetime.ApplicationStopping.Register(() =>
+{
+    Console.WriteLine("Shutting down... stopping all dedicated servers.");
+    dsLauncher.Dispose();
+});
 
 app.Run();

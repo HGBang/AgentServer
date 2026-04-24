@@ -108,13 +108,28 @@ public class WebSocketHandler
                 _connections.AddConnection(req.UserId, webSocket);
                 currentUserId = req.UserId;
 
-                await _broadcaster.SendToUser(req.UserId, new
+                // 로비 DS가 실행 중인지 확인
+                if (_dsLauncher.IsLobbyReady)
                 {
-                    type = "login_result",
-                    success = true,
-                    userId = user.UserId,
-                    displayName = user.DisplayName
-                });
+                    await _broadcaster.SendToUser(req.UserId, new
+                    {
+                        type = "login_result",
+                        success = true,
+                        userId = user.UserId,
+                        displayName = user.DisplayName,
+                        lobbyServerIp = _dsLauncher.LobbyIp,
+                        lobbyServerPort = _dsLauncher.LobbyPort
+                    });
+                }
+                else
+                {
+                    await _broadcaster.SendToUser(req.UserId, new
+                    {
+                        type = "login_result",
+                        success = false,
+                        error = "Lobby server is not available"
+                    });
+                }
 
                 _logger.LogInformation("User logged in: {UserId}", req.UserId);
                 await _gameLogger.LogRoomEvent("LOGIN", "SYSTEM", req.UserId, req.DisplayName);
@@ -288,9 +303,9 @@ public class WebSocketHandler
                     break;
                 }
 
-                // DedicatedServer 실행
+                // Game DedicatedServer 실행
                 await _roomService.UpdateRoomState(req.RoomId, RoomState.Starting);
-                var (process, port) = _dsLauncher.LaunchServer(req.RoomId, room.MapName);
+                var (process, port) = _dsLauncher.LaunchGameServer(req.RoomId, room.MapName);
 
                 if (process != null)
                 {

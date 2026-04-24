@@ -1,6 +1,31 @@
 =====================================
   AgentServer - Unreal Engine 연동 예시
+  (Lobby DS + Game DS 2단 구조)
 =====================================
+
+
+■ 전체 흐름
+--------------------------------------
+[Client UE]                  [AgentServer C#]           [Lobby DS (UE)]        [Game DS (UE)]
+    |                              |                         |                      |
+    +-- 1. WebSocket 연결 --------→|                         |                      |
+    +-- 2. SendLogin -------------→|                         |                      |
+    |                              +-- 인증/검증              |                      |
+    |←- 3. login_result -----------|                         |                      |
+    |      (lobbyIp, lobbyPort)    |                         |                      |
+    |                              |                         |                      |
+    +-- 4. ClientTravel -----------------------------------→| (로비 DS 접속)       |
+    |      로비 월드에서 플레이     |                         |                      |
+    |      (방 목록, 채팅, 캐릭터)  |                         |                      |
+    |                              |                         |                      |
+    +-- 5. SendCreateRoom --------→| → Room DB 저장          |                      |
+    +-- 6. SendStartGame ---------→| → Game DS 실행 ------→  |                  →  | (프로세스 시작)
+    |←- 7. game_started -----------|                         |                      |
+    |      (gameIp, gamePort)      |                         |                      |
+    |                              |                         |                      |
+    +-- 8. ClientTravel -------------------------------------------------------→   | (게임 DS 접속)
+    |      게임 플레이 (UE Replication)                                              |
+
 
 ■ Build.cs 모듈 추가
 --------------------------------------
@@ -9,14 +34,21 @@ PublicDependencyModuleNames.AddRange(new string[] {
 });
 
 
-■ 헤더 (ChatWebSocketComponent.h)
+■ 헤더 (AgentServerComponent.h)
 --------------------------------------
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
 #include "IWebSocket.h"
-#include "ChatWebSocketComponent.generated.h"
+#include "AgentServerComponent.generated.h"
+
+// 로그인 결과 델리게이트 (로비 DS 접속 정보 포함)
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FOnLoginResult,
+    bool, bSuccess,
+    const FString&, UserId,
+    const FString&, LobbyIp,
+    int32, LobbyPort);
 
 // 채팅 수신 델리게이트
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnChatReceived,
@@ -28,35 +60,49 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnChatReceived,
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnRoomListUpdated,
     const FString&, RoomListJson);
 
-// 게임 시작 델리게이트 (DS 접속 정보)
+// 방 생성 결과
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnRoomCreated,
+    const FString&, RoomId,
+    const FString&, RoomName);
+
+// 방 참가자 갱신
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnRoomUpdated,
+    const FString&, RoomUpdateJson);
+
+// 게임 시작 델리게이트 (Game DS 접속 정보)
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnGameStarted,
     const FString&, ServerIp,
     int32, ServerPort);
 
 UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
-class MYPROJECT_API UChatWebSocketComponent : public UActorComponent
+class MYPROJECT_API UAgentServerComponent : public UActorComponent
 {
     GENERATED_BODY()
 
 public:
-    UChatWebSocketComponent();
+    UAgentServerComponent();
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
-    // 서버 연결
+    // ── 연결 ──
     UFUNCTION(BlueprintCallable, Category = "AgentServer")
     void Connect(const FString& Url);
 
     UFUNCTION(BlueprintCallable, Category = "AgentServer")
     void Disconnect();
 
-    // 패킷 전송 함수
+    UFUNCTION(BlueprintPure, Category = "AgentServer")
+    bool IsConnected() const;
+
+    // ── 로그인 (검증 후 로비 DS 접속 정보 수신) ──
     UFUNCTION(BlueprintCallable, Category = "AgentServer")
     void SendLogin(const FString& UserId, const FString& DisplayName);
 
+    // ── 채팅 ──
     UFUNCTION(BlueprintCallable, Category = "AgentServer")
     void SendChat(const FString& Message, const FString& RoomId);
 
+    // ── 방 관리 ──
     UFUNCTION(BlueprintCallable, Category = "AgentServer")
     void SendCreateRoom(const FString& RoomName, int32 MaxPlayers, const FString& MapName);
 
@@ -64,14 +110,41 @@ public:
     void SendJoinRoom(const FString& RoomId);
 
     UFUNCTION(BlueprintCallable, Category = "AgentServer")
+    void SendLeaveRoom(const FString& RoomId);
+
+    UFUNCTION(BlueprintCallable, Category = "AgentServer")
+    void SendReady(const FString& RoomId, bool bIsReady);
+
+    UFUNCTION(BlueprintCallable, Category = "AgentServer")
+    void SendGetRooms();
+
+    // ── 게임 시작 (호스트만, Game DS 실행 요청) ──
+    UFUNCTION(BlueprintCallable, Category = "AgentServer")
     void SendStartGame(const FString& RoomId);
 
-    // UMG 바인딩용 델리게이트
+    // ── 로비 DS Travel 헬퍼 ──
+    UFUNCTION(BlueprintCallable, Category = "AgentServer")
+    void TravelToLobby(const FString& LobbyIp, int32 LobbyPort);
+
+    // ── Game DS Travel 헬퍼 ──
+    UFUNCTION(BlueprintCallable, Category = "AgentServer")
+    void TravelToGameServer(const FString& GameIp, int32 GamePort);
+
+    // ── 델리게이트 ──
+    UPROPERTY(BlueprintAssignable, Category = "AgentServer")
+    FOnLoginResult OnLoginResult;
+
     UPROPERTY(BlueprintAssignable, Category = "AgentServer")
     FOnChatReceived OnChatReceived;
 
     UPROPERTY(BlueprintAssignable, Category = "AgentServer")
     FOnRoomListUpdated OnRoomListUpdated;
+
+    UPROPERTY(BlueprintAssignable, Category = "AgentServer")
+    FOnRoomCreated OnRoomCreated;
+
+    UPROPERTY(BlueprintAssignable, Category = "AgentServer")
+    FOnRoomUpdated OnRoomUpdated;
 
     UPROPERTY(BlueprintAssignable, Category = "AgentServer")
     FOnGameStarted OnGameStarted;
@@ -87,72 +160,85 @@ private:
 };
 
 
-■ CPP (ChatWebSocketComponent.cpp)
+■ CPP (AgentServerComponent.cpp)
 --------------------------------------
-#include "ChatWebSocketComponent.h"
+#include "AgentServerComponent.h"
 #include "WebSocketsModule.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "Kismet/GameplayStatics.h"
 
-UChatWebSocketComponent::UChatWebSocketComponent()
+UAgentServerComponent::UAgentServerComponent()
 {
     PrimaryComponentTick.bCanEverTick = false;
 }
 
-void UChatWebSocketComponent::BeginPlay()
+void UAgentServerComponent::BeginPlay()
 {
     Super::BeginPlay();
     FModuleManager::Get().LoadModuleChecked("WebSockets");
 }
 
-void UChatWebSocketComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+void UAgentServerComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     Disconnect();
     Super::EndPlay(EndPlayReason);
 }
 
 // ── 연결 ──
-void UChatWebSocketComponent::Connect(const FString& Url)
+void UAgentServerComponent::Connect(const FString& Url)
 {
-    // ex: "ws://localhost:5000/ws"
+    if (WebSocket && WebSocket->IsConnected())
+    {
+        Disconnect();
+    }
+
     WebSocket = FWebSocketsModule::Get().CreateWebSocket(Url, TEXT("ws"));
 
-    WebSocket->OnConnected().AddUObject(this, &UChatWebSocketComponent::OnWsConnected);
-    WebSocket->OnConnectionError().AddUObject(this, &UChatWebSocketComponent::OnWsConnectionError);
-    WebSocket->OnClosed().AddUObject(this, &UChatWebSocketComponent::OnWsClosed);
-    WebSocket->OnMessage().AddUObject(this, &UChatWebSocketComponent::OnWsMessage);
+    WebSocket->OnConnected().AddUObject(this, &UAgentServerComponent::OnWsConnected);
+    WebSocket->OnConnectionError().AddUObject(this, &UAgentServerComponent::OnWsConnectionError);
+    WebSocket->OnClosed().AddUObject(this, &UAgentServerComponent::OnWsClosed);
+    WebSocket->OnMessage().AddUObject(this, &UAgentServerComponent::OnWsMessage);
 
     WebSocket->Connect();
 }
 
-void UChatWebSocketComponent::Disconnect()
+void UAgentServerComponent::Disconnect()
 {
-    if (WebSocket && WebSocket->IsConnected())
+    if (WebSocket)
     {
-        WebSocket->Close();
+        if (WebSocket->IsConnected())
+        {
+            WebSocket->Close();
+        }
+        WebSocket = nullptr;
     }
-    WebSocket = nullptr;
 }
 
-// ── 콜백 (서버 -> 클라이언트) ──
-void UChatWebSocketComponent::OnWsConnected()
+bool UAgentServerComponent::IsConnected() const
 {
-    UE_LOG(LogTemp, Log, TEXT("WebSocket Connected"));
+    return WebSocket && WebSocket->IsConnected();
 }
 
-void UChatWebSocketComponent::OnWsConnectionError(const FString& Error)
+// ── 콜백 ──
+void UAgentServerComponent::OnWsConnected()
 {
-    UE_LOG(LogTemp, Error, TEXT("WebSocket Error: %s"), *Error);
+    UE_LOG(LogTemp, Log, TEXT("[AgentServer] WebSocket Connected"));
 }
 
-void UChatWebSocketComponent::OnWsClosed(int32 StatusCode, const FString& Reason, bool bWasClean)
+void UAgentServerComponent::OnWsConnectionError(const FString& Error)
 {
-    UE_LOG(LogTemp, Log, TEXT("WebSocket Closed: %s"), *Reason);
+    UE_LOG(LogTemp, Error, TEXT("[AgentServer] Connection Error: %s"), *Error);
 }
 
-void UChatWebSocketComponent::OnWsMessage(const FString& Message)
+void UAgentServerComponent::OnWsClosed(int32 StatusCode, const FString& Reason, bool bWasClean)
+{
+    UE_LOG(LogTemp, Log, TEXT("[AgentServer] Closed: %s"), *Reason);
+}
+
+void UAgentServerComponent::OnWsMessage(const FString& Message)
 {
     TSharedPtr<FJsonObject> Json;
     auto Reader = TJsonReaderFactory<>::Create(Message);
@@ -161,27 +247,80 @@ void UChatWebSocketComponent::OnWsMessage(const FString& Message)
 
     FString Type = Json->GetStringField(TEXT("type"));
 
-    if (Type == TEXT("chat_message"))
+    // ── login_result: 로비 DS 접속 정보 포함 ──
+    if (Type == TEXT("login_result"))
+    {
+        bool bSuccess = Json->GetBoolField(TEXT("success"));
+        FString UserId = Json->HasField(TEXT("userId")) ? Json->GetStringField(TEXT("userId")) : TEXT("");
+        FString LobbyIp = Json->HasField(TEXT("lobbyServerIp")) ? Json->GetStringField(TEXT("lobbyServerIp")) : TEXT("");
+        int32 LobbyPort = Json->HasField(TEXT("lobbyServerPort")) ? Json->GetIntegerField(TEXT("lobbyServerPort")) : 0;
+
+        OnLoginResult.Broadcast(bSuccess, UserId, LobbyIp, LobbyPort);
+
+        if (bSuccess)
+        {
+            UE_LOG(LogTemp, Log, TEXT("[AgentServer] Login OK -> Lobby DS at %s:%d"), *LobbyIp, LobbyPort);
+        }
+    }
+    // ── chat_message ──
+    else if (Type == TEXT("chat_message"))
     {
         FString SenderName = Json->GetStringField(TEXT("senderName"));
         FString Msg = Json->GetStringField(TEXT("message"));
-        FString RoomId = Json->GetStringField(TEXT("roomId"));
+        FString RoomId = Json->HasField(TEXT("roomId")) ? Json->GetStringField(TEXT("roomId")) : TEXT("");
         OnChatReceived.Broadcast(SenderName, Msg, RoomId);
     }
+    // ── room_list ──
     else if (Type == TEXT("room_list"))
     {
         OnRoomListUpdated.Broadcast(Message);
     }
+    // ── room_created ──
+    else if (Type == TEXT("room_created"))
+    {
+        FString RoomId = Json->GetStringField(TEXT("roomId"));
+        FString RoomName = Json->GetStringField(TEXT("roomName"));
+        OnRoomCreated.Broadcast(RoomId, RoomName);
+    }
+    // ── room_update (참가자 갱신) ──
+    else if (Type == TEXT("room_update"))
+    {
+        OnRoomUpdated.Broadcast(Message);
+    }
+    // ── game_started: Game DS 접속 정보 ──
     else if (Type == TEXT("game_started"))
     {
         FString Ip = Json->GetStringField(TEXT("serverIp"));
         int32 Port = Json->GetIntegerField(TEXT("serverPort"));
         OnGameStarted.Broadcast(Ip, Port);
+
+        UE_LOG(LogTemp, Log, TEXT("[AgentServer] Game started -> DS at %s:%d"), *Ip, Port);
+    }
+}
+
+// ── Travel 헬퍼 ──
+void UAgentServerComponent::TravelToLobby(const FString& LobbyIp, int32 LobbyPort)
+{
+    if (APlayerController* PC = UGameplayStatics::GetPlayerController(this, 0))
+    {
+        FString TravelURL = FString::Printf(TEXT("%s:%d"), *LobbyIp, LobbyPort);
+        PC->ClientTravel(TravelURL, TRAVEL_Absolute);
+        UE_LOG(LogTemp, Log, TEXT("[AgentServer] Traveling to Lobby DS: %s"), *TravelURL);
+    }
+}
+
+void UAgentServerComponent::TravelToGameServer(const FString& GameIp, int32 GamePort)
+{
+    if (APlayerController* PC = UGameplayStatics::GetPlayerController(this, 0))
+    {
+        FString TravelURL = FString::Printf(TEXT("%s:%d"), *GameIp, GamePort);
+        PC->ClientTravel(TravelURL, TRAVEL_Absolute);
+        UE_LOG(LogTemp, Log, TEXT("[AgentServer] Traveling to Game DS: %s"), *TravelURL);
     }
 }
 
 // ── 패킷 전송 유틸 ──
-void UChatWebSocketComponent::SendPacket(const FString& Type, const TSharedRef<FJsonObject>& Data)
+void UAgentServerComponent::SendPacket(const FString& Type, const TSharedRef<FJsonObject>& Data)
 {
     if (!WebSocket || !WebSocket->IsConnected())
         return;
@@ -198,7 +337,7 @@ void UChatWebSocketComponent::SendPacket(const FString& Type, const TSharedRef<F
 }
 
 // ── 전송 함수 ──
-void UChatWebSocketComponent::SendLogin(const FString& UserId, const FString& DisplayName)
+void UAgentServerComponent::SendLogin(const FString& UserId, const FString& DisplayName)
 {
     auto Data = MakeShared<FJsonObject>();
     Data->SetStringField(TEXT("userId"), UserId);
@@ -206,7 +345,7 @@ void UChatWebSocketComponent::SendLogin(const FString& UserId, const FString& Di
     SendPacket(TEXT("login"), Data);
 }
 
-void UChatWebSocketComponent::SendChat(const FString& Message, const FString& RoomId)
+void UAgentServerComponent::SendChat(const FString& Message, const FString& RoomId)
 {
     auto Data = MakeShared<FJsonObject>();
     Data->SetStringField(TEXT("message"), Message);
@@ -215,7 +354,7 @@ void UChatWebSocketComponent::SendChat(const FString& Message, const FString& Ro
     SendPacket(TEXT("chat"), Data);
 }
 
-void UChatWebSocketComponent::SendCreateRoom(const FString& RoomName, int32 MaxPlayers, const FString& MapName)
+void UAgentServerComponent::SendCreateRoom(const FString& RoomName, int32 MaxPlayers, const FString& MapName)
 {
     auto Data = MakeShared<FJsonObject>();
     Data->SetStringField(TEXT("roomName"), RoomName);
@@ -224,14 +363,35 @@ void UChatWebSocketComponent::SendCreateRoom(const FString& RoomName, int32 MaxP
     SendPacket(TEXT("create_room"), Data);
 }
 
-void UChatWebSocketComponent::SendJoinRoom(const FString& RoomId)
+void UAgentServerComponent::SendJoinRoom(const FString& RoomId)
 {
     auto Data = MakeShared<FJsonObject>();
     Data->SetStringField(TEXT("roomId"), RoomId);
     SendPacket(TEXT("join_room"), Data);
 }
 
-void UChatWebSocketComponent::SendStartGame(const FString& RoomId)
+void UAgentServerComponent::SendLeaveRoom(const FString& RoomId)
+{
+    auto Data = MakeShared<FJsonObject>();
+    Data->SetStringField(TEXT("roomId"), RoomId);
+    SendPacket(TEXT("leave_room"), Data);
+}
+
+void UAgentServerComponent::SendReady(const FString& RoomId, bool bIsReady)
+{
+    auto Data = MakeShared<FJsonObject>();
+    Data->SetStringField(TEXT("roomId"), RoomId);
+    Data->SetBoolField(TEXT("isReady"), bIsReady);
+    SendPacket(TEXT("ready"), Data);
+}
+
+void UAgentServerComponent::SendGetRooms()
+{
+    auto Data = MakeShared<FJsonObject>();
+    SendPacket(TEXT("get_rooms"), Data);
+}
+
+void UAgentServerComponent::SendStartGame(const FString& RoomId)
 {
     auto Data = MakeShared<FJsonObject>();
     Data->SetStringField(TEXT("roomId"), RoomId);
@@ -239,37 +399,139 @@ void UChatWebSocketComponent::SendStartGame(const FString& RoomId)
 }
 
 
-■ 사용 예시 (PlayerController 또는 GameInstance에 부착)
+■ 사용 예시 (GameInstance에 부착 - 레벨 전환에도 유지)
 --------------------------------------
-// 1) C++ 생성자에서 컴포넌트 추가
-ChatWS = CreateDefaultSubobject<UChatWebSocketComponent>(TEXT("ChatWebSocket"));
 
-// 2) 또는 런타임에 동적 추가
-auto* ChatWS = NewObject<UChatWebSocketComponent>(this);
-ChatWS->RegisterComponent();
+// === MyGameInstance.h ===
+UCLASS()
+class UMyGameInstance : public UGameInstance
+{
+    GENERATED_BODY()
+public:
+    UPROPERTY()
+    UAgentServerComponent* AgentServer;
 
-// 3) 연결 및 로그인
-ChatWS->Connect(TEXT("ws://localhost:5000/ws"));
-ChatWS->SendLogin(TEXT("Player1"), TEXT("홍길동"));
+    virtual void Init() override;
+    virtual void Shutdown() override;
 
-// 4) 델리게이트 바인딩 (UMG 위젯에서)
-ChatWS->OnChatReceived.AddDynamic(this, &UMyChatWidget::HandleChatReceived);
-ChatWS->OnGameStarted.AddDynamic(this, &UMyChatWidget::HandleGameStarted);
+    // 로그인 결과 핸들러
+    UFUNCTION()
+    void HandleLoginResult(bool bSuccess, const FString& UserId,
+        const FString& LobbyIp, int32 LobbyPort);
 
-// 5) 블루프린트에서도 사용 가능
-//    Actor에 "ChatWebSocketComponent" 추가 후
-//    이벤트 그래프에서 OnChatReceived, OnGameStarted 바인딩
+    // 게임 시작 핸들러
+    UFUNCTION()
+    void HandleGameStarted(const FString& GameIp, int32 GamePort);
+};
 
 
-■ 통신 흐름
+// === MyGameInstance.cpp ===
+void UMyGameInstance::Init()
+{
+    Super::Init();
+
+    // 1) AgentServer 컴포넌트 생성
+    AgentServer = NewObject<UAgentServerComponent>(this);
+    AgentServer->RegisterComponent();
+
+    // 2) 델리게이트 바인딩
+    AgentServer->OnLoginResult.AddDynamic(this, &UMyGameInstance::HandleLoginResult);
+    AgentServer->OnGameStarted.AddDynamic(this, &UMyGameInstance::HandleGameStarted);
+
+    // 3) AgentServer에 WebSocket 연결
+    AgentServer->Connect(TEXT("ws://localhost:5000/ws"));
+}
+
+void UMyGameInstance::Shutdown()
+{
+    if (AgentServer)
+    {
+        AgentServer->Disconnect();
+    }
+    Super::Shutdown();
+}
+
+// 4) 로그인 성공 -> 로비 DS로 Travel
+void UMyGameInstance::HandleLoginResult(bool bSuccess, const FString& UserId,
+    const FString& LobbyIp, int32 LobbyPort)
+{
+    if (bSuccess)
+    {
+        UE_LOG(LogTemp, Log, TEXT("Login OK! Traveling to Lobby DS..."));
+        AgentServer->TravelToLobby(LobbyIp, LobbyPort);
+    }
+    else
+    {
+        UE_LOG(LogTemp, Error, TEXT("Login Failed!"));
+    }
+}
+
+// 5) 게임 시작 -> Game DS로 Travel
+void UMyGameInstance::HandleGameStarted(const FString& GameIp, int32 GamePort)
+{
+    UE_LOG(LogTemp, Log, TEXT("Game started! Traveling to Game DS..."));
+    AgentServer->TravelToGameServer(GameIp, GamePort);
+}
+
+
+■ 로그인 UI (UMG 위젯) 예시
 --------------------------------------
-[UE Client]                          [AgentServer]
-    |                                      |
-    +-- Connect ws://localhost:5000/ws --->|
-    +-- SendLogin ----------------------->| -> DB 저장
-    +-- SendCreateRoom ------------------>| -> Room 생성
-    +-- SendChat ------------------------>| -> DB 저장 -> BroadcastToRoom
-    |<---- OnChatReceived 델리게이트 -----|
-    +-- SendStartGame ------------------->| -> DS.exe 실행
-    |<---- OnGameStarted(IP, Port) -------|
-    +-- OpenLevel(IP:Port) -> DS 접속     |
+// 로그인 버튼 클릭 시
+void ULoginWidget::OnLoginButtonClicked()
+{
+    auto* GI = Cast<UMyGameInstance>(GetGameInstance());
+    if (GI && GI->AgentServer)
+    {
+        FString UserId = UserIdInput->GetText().ToString();
+        FString DisplayName = DisplayNameInput->GetText().ToString();
+        GI->AgentServer->SendLogin(UserId, DisplayName);
+    }
+}
+
+
+■ 로비 DS 안에서의 사용 (방 생성/참가/채팅)
+--------------------------------------
+// 로비 DS 월드에서 AgentServer 컴포넌트에 접근
+auto* GI = Cast<UMyGameInstance>(GetGameInstance());
+
+// 방 목록 요청
+GI->AgentServer->SendGetRooms();
+
+// 방 생성
+GI->AgentServer->SendCreateRoom(TEXT("테스트방"), 8, TEXT("/Game/Maps/Arena"));
+
+// 방 참가
+GI->AgentServer->SendJoinRoom(TEXT("abc123"));
+
+// 채팅
+GI->AgentServer->SendChat(TEXT("안녕하세요!"), TEXT("abc123"));
+
+// 레디
+GI->AgentServer->SendReady(TEXT("abc123"), true);
+
+// 게임 시작 (호스트만)
+GI->AgentServer->SendStartGame(TEXT("abc123"));
+
+
+■ appsettings.json 설정
+--------------------------------------
+{
+  "ServerPort": 5000,
+  "DedicatedServer": {
+    "Lobby": {
+      "ExePath": "C:/UnrealProject/Binaries/Win64/MyGameServer.exe",
+      "MapName": "/Game/Maps/Lobby",
+      "Ip": "127.0.0.1",
+      "Port": 7777,
+      "AdditionalArgs": "-nosteam"
+    },
+    "Game": {
+      "ExePath": "C:/UnrealProject/Binaries/Win64/MyGameServer.exe",
+      "StartPort": 7787,
+      "AdditionalArgs": "-nosteam"
+    }
+  }
+}
+
+※ Lobby와 Game이 같은 exe를 쓸 수도 있고,
+  별도 빌드로 분리할 수도 있음 (MapName으로 구분)
