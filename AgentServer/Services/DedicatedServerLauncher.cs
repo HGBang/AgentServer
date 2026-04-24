@@ -45,11 +45,15 @@ public class DedicatedServerLauncher : IDisposable
     public bool HasAvailableLobby => _lobbyServers.Values.Any(l => l.IsAlive && l.CurrentPlayers < MaxPlayersPerLobby);
 
     /// <summary>
-    /// 서버 시작 시 첫 로비 DS를 실행한다.
+    /// 서버 시작 시 첫 로비 DS를 실행한다. (이 로비는 0명이어도 종료되지 않음)
     /// </summary>
     public bool LaunchInitialLobby()
     {
         var lobby = LaunchNewLobbyInstance();
+        if (lobby != null)
+        {
+            lobby.IsInitial = true;
+        }
         return lobby != null;
     }
 
@@ -119,6 +123,15 @@ public class DedicatedServerLauncher : IDisposable
                     _logger.LogInformation(
                         "User {UserId} removed from Lobby {LobbyId} (Players:{Current}/{Max})",
                         userId, lobbyId, lobby.CurrentPlayers, MaxPlayersPerLobby);
+
+                    // 추가 생성된 로비가 0명이면 자동 종료
+                    if (!lobby.IsInitial && lobby.CurrentPlayers == 0)
+                    {
+                        _logger.LogInformation(
+                            "Lobby {LobbyId} is empty and not initial. Auto-shutting down.",
+                            lobbyId);
+                        StopLobbyServer(lobbyId);
+                    }
                 }
             }
         }
@@ -353,5 +366,6 @@ public class LobbyInstance
     public Process Process { get; set; } = null!;
     public int Port { get; set; }
     public int CurrentPlayers { get; set; }
+    public bool IsInitial { get; set; }
     public bool IsAlive => Process is { HasExited: false };
 }
