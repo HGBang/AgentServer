@@ -18,6 +18,7 @@ public class WebSocketHandler
     private readonly ChatService _chatService;
     private readonly DedicatedServerLauncher _dsLauncher;
     private readonly MessageBroadcaster _broadcaster;
+    private readonly GameLogger _gameLogger;
     private readonly ILogger<WebSocketHandler> _logger;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -33,6 +34,7 @@ public class WebSocketHandler
         ChatService chatService,
         DedicatedServerLauncher dsLauncher,
         MessageBroadcaster broadcaster,
+        GameLogger gameLogger,
         ILogger<WebSocketHandler> logger)
     {
         _connections = connections;
@@ -41,6 +43,7 @@ public class WebSocketHandler
         _chatService = chatService;
         _dsLauncher = dsLauncher;
         _broadcaster = broadcaster;
+        _gameLogger = gameLogger;
         _logger = logger;
     }
 
@@ -114,6 +117,7 @@ public class WebSocketHandler
                 });
 
                 _logger.LogInformation("User logged in: {UserId}", req.UserId);
+                await _gameLogger.LogRoomEvent("LOGIN", "SYSTEM", req.UserId, req.DisplayName);
                 break;
             }
 
@@ -140,6 +144,9 @@ public class WebSocketHandler
 
                 // 전체에 방 목록 갱신 알림
                 await BroadcastRoomList();
+                await _gameLogger.LogRoomEvent("CREATED", room.RoomId, currentUserId,
+                    user?.DisplayName ?? currentUserId,
+                    $"RoomName:{req.RoomName} MaxPlayers:{req.MaxPlayers} Map:{req.MapName}");
                 break;
             }
 
@@ -164,6 +171,8 @@ public class WebSocketHandler
 
                     // 방 참가자 갱신 알림
                     await BroadcastRoomUpdate(req.RoomId);
+                    await _gameLogger.LogRoomEvent("JOIN", req.RoomId, currentUserId,
+                        user?.DisplayName ?? currentUserId);
 
                     // 채팅 히스토리 전송
                     var history = await _chatService.GetRoomHistory(req.RoomId);
@@ -196,6 +205,7 @@ public class WebSocketHandler
             {
                 if (currentUserId == null) break;
                 var req = JsonSerializer.Deserialize<LeaveRoomRequest>(dataJson, JsonOptions)!;
+                var leaveUser = await _userService.GetUser(currentUserId);
                 await _roomService.LeaveRoom(req.RoomId, currentUserId);
                 _connections.RemoveUserRoom(currentUserId);
 
@@ -207,6 +217,8 @@ public class WebSocketHandler
 
                 await BroadcastRoomUpdate(req.RoomId);
                 await BroadcastRoomList();
+                await _gameLogger.LogRoomEvent("LEAVE", req.RoomId, currentUserId,
+                    leaveUser?.DisplayName ?? currentUserId);
                 break;
             }
 
@@ -244,6 +256,9 @@ public class WebSocketHandler
                         await _broadcaster.SendToUser(currentUserId, chatPayload);
                         break;
                 }
+
+                await _gameLogger.LogChat(currentUserId, senderName, req.Message,
+                    req.Type.ToString(), req.RoomId);
                 break;
             }
 
@@ -290,6 +305,9 @@ public class WebSocketHandler
                         serverIp = "127.0.0.1",
                         serverPort = port
                     });
+
+                    await _gameLogger.LogRoomEvent("GAME_START", req.RoomId, currentUserId,
+                        null, $"Port:{port} PID:{process.Id} Map:{room.MapName}");
                 }
                 else
                 {
@@ -348,6 +366,7 @@ public class WebSocketHandler
     private async Task HandleDisconnect(string userId)
     {
         _logger.LogInformation("User disconnected: {UserId}", userId);
+        var dcUser = await _userService.GetUser(userId);
 
         // 현재 방에서 퇴장
         var roomId = _connections.GetUserRoom(userId);
@@ -355,10 +374,14 @@ public class WebSocketHandler
         {
             await _roomService.LeaveRoom(roomId, userId);
             await BroadcastRoomUpdate(roomId);
+            await _gameLogger.LogRoomEvent("DISCONNECT_LEAVE", roomId, userId,
+                dcUser?.DisplayName ?? userId);
         }
 
         await _userService.SetOffline(userId);
         _connections.RemoveConnection(userId);
+        await _gameLogger.LogRoomEvent("LOGOUT", "SYSTEM", userId,
+            dcUser?.DisplayName ?? userId);
 
         await BroadcastRoomList();
     }

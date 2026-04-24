@@ -14,6 +14,7 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 // ── Services ──
 builder.Services.AddSingleton<ConnectionManager>();
 builder.Services.AddSingleton<DedicatedServerLauncher>();
+builder.Services.AddSingleton<GameLogger>();
 builder.Services.AddScoped<UserService>();
 builder.Services.AddScoped<RoomService>();
 builder.Services.AddScoped<ChatService>();
