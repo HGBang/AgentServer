@@ -108,19 +108,31 @@ public class WebSocketHandler
                 _connections.AddConnection(req.UserId, webSocket);
                 currentUserId = req.UserId;
 
-                // 여유 있는 로비 DS에 배정 (DS가 없어도 로그인은 성공)
+                // 여유 있는 로비 DS에 배정
                 var lobby = _dsLauncher.AssignUserToLobby(req.UserId);
 
-                await _broadcaster.SendToUser(req.UserId, new
+                if (lobby != null)
                 {
-                    type = "login_result",
-                    success = true,
-                    userId = user.UserId,
-                    displayName = user.DisplayName,
-                    lobbyServerIp = lobby != null ? _dsLauncher.LobbyIp : "",
-                    lobbyServerPort = lobby?.Port ?? 0,
-                    lobbyId = lobby?.LobbyId ?? ""
-                });
+                    await _broadcaster.SendToUser(req.UserId, new
+                    {
+                        type = "login_result",
+                        success = true,
+                        userId = user.UserId,
+                        displayName = user.DisplayName,
+                        lobbyServerIp = _dsLauncher.LobbyIp,
+                        lobbyServerPort = lobby.Port,
+                        lobbyId = lobby.LobbyId
+                    });
+                }
+                else
+                {
+                    await _broadcaster.SendToUser(req.UserId, new
+                    {
+                        type = "login_result",
+                        success = false,
+                        error = "No lobby server available"
+                    });
+                }
 
                 _logger.LogInformation("User logged in: {UserId}", req.UserId);
                 await _gameLogger.LogRoomEvent("LOGIN", "SYSTEM", req.UserId, req.DisplayName);
