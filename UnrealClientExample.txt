@@ -117,6 +117,10 @@ public:
     UFUNCTION(BlueprintCallable, Category = "AgentServer")
     void SendChat(const FString& Message, const FString& RoomId);
 
+    // ── 글로벌 채팅 (방 없이 테스트용) ──
+    UFUNCTION(BlueprintCallable, Category = "AgentServer")
+    void SendGlobalChat(const FString& Message);
+
     // ── 방 관리 ──
     UFUNCTION(BlueprintCallable, Category = "AgentServer")
     void SendCreateRoom(const FString& RoomName, int32 MaxPlayers, const FString& MapName);
@@ -370,6 +374,14 @@ void UAgentServerComponent::SendChat(const FString& Message, const FString& Room
     SendPacket(TEXT("chat"), Data);
 }
 
+void UAgentServerComponent::SendGlobalChat(const FString& Message)
+{
+    auto Data = MakeShared<FJsonObject>();
+    Data->SetStringField(TEXT("message"), Message);
+    Data->SetNumberField(TEXT("type"), 0); // Global=0
+    SendPacket(TEXT("chat"), Data);
+}
+
 void UAgentServerComponent::SendCreateRoom(const FString& RoomName, int32 MaxPlayers, const FString& MapName)
 {
     auto Data = MakeShared<FJsonObject>();
@@ -559,3 +571,126 @@ GI->AgentServer->SendStartGame(TEXT("abc123"));
    Game:  7878, 7879, 7880, ...
 
 ※ 로비 현황 API: http://localhost:5000/api/lobbies
+
+
+■ [테스트] DS 없이 채팅만 테스트 (최소 코드)
+--------------------------------------
+// DS 실행 없이 AgentServer만 켜고 글로벌 채팅이 오가는지 확인하는 예시.
+// GameInstance에 아래 코드만 넣으면 됨.
+// 서버는 그냥 dotnet run 하면 됨 (Lobby DS exe 없어도 로그인 성공)
+
+// === ChatTestGameInstance.h ===
+#pragma once
+#include "CoreMinimal.h"
+#include "Engine/GameInstance.h"
+#include "AgentServerComponent.h"
+#include "ChatTestGameInstance.generated.h"
+
+UCLASS()
+class MYPROJECT_API UChatTestGameInstance : public UGameInstance
+{
+    GENERATED_BODY()
+public:
+    UPROPERTY()
+    UAgentServerComponent* AgentServer;
+
+    virtual void Init() override;
+    virtual void Shutdown() override;
+
+    UFUNCTION()
+    void OnLogin(bool bSuccess, const FString& UserId,
+        const FString& LobbyIp, int32 LobbyPort);
+
+    UFUNCTION()
+    void OnChat(const FString& SenderName, const FString& Message,
+        const FString& RoomId);
+
+    // 블루프린트에서 호출할 채팅 전송 함수
+    UFUNCTION(BlueprintCallable, Category = "ChatTest")
+    void TestSendChat(const FString& Message);
+};
+
+
+// === ChatTestGameInstance.cpp ===
+#include "ChatTestGameInstance.h"
+
+void UChatTestGameInstance::Init()
+{
+    Super::Init();
+
+    AgentServer = NewObject<UAgentServerComponent>(this);
+    AgentServer->RegisterComponent();
+
+    // 델리게이트 바인딩
+    AgentServer->OnLoginResult.AddDynamic(this, &UChatTestGameInstance::OnLogin);
+    AgentServer->OnChatReceived.AddDynamic(this, &UChatTestGameInstance::OnChat);
+
+    // 서버 연결
+    AgentServer->Connect(TEXT("ws://localhost:5000/ws"));
+
+    // 연결 후 자동 로그인 (타이머로 약간 딜레이)
+    FTimerHandle TimerHandle;
+    GetWorld()->GetTimerManager().SetTimer(TimerHandle, [this]()
+    {
+        AgentServer->SendLogin(TEXT("TestUser1"), TEXT("테스터1"));
+    }, 1.0f, false);
+}
+
+void UChatTestGameInstance::Shutdown()
+{
+    if (AgentServer) AgentServer->Disconnect();
+    Super::Shutdown();
+}
+
+void UChatTestGameInstance::OnLogin(bool bSuccess, const FString& UserId,
+    const FString& LobbyIp, int32 LobbyPort)
+{
+    if (bSuccess)
+    {
+        // DS Travel 안 함! 로그인만 확인
+        UE_LOG(LogTemp, Warning, TEXT("=== LOGIN SUCCESS: %s ==="), *UserId);
+        UE_LOG(LogTemp, Warning, TEXT("=== Lobby DS 접속 안 함 (채팅 테스트 모드) ==="));
+
+        // 로그인 되자마자 테스트 메시지 전송
+        AgentServer->SendGlobalChat(TEXT("Hello from Unreal!"));
+    }
+    else
+    {
+        UE_LOG(LogTemp, Error, TEXT("=== LOGIN FAILED ==="));
+    }
+}
+
+void UChatTestGameInstance::OnChat(const FString& SenderName, const FString& Message,
+    const FString& RoomId)
+{
+    // 채팅 수신 확인 로그
+    UE_LOG(LogTemp, Warning, TEXT("=== CHAT RECEIVED: [%s] %s ==="), *SenderName, *Message);
+
+    // 여기서 UI에 표시하거나, GEngine->AddOnScreenDebugMessage 로 화면에 출력
+    if (GEngine)
+    {
+        GEngine->AddOnScreenDebugMessage(-1, 10.f, FColor::Green,
+            FString::Printf(TEXT("[%s] %s"), *SenderName, *Message));
+    }
+}
+
+void UChatTestGameInstance::TestSendChat(const FString& Message)
+{
+    if (AgentServer && AgentServer->IsConnected())
+    {
+        AgentServer->SendGlobalChat(Message);
+        UE_LOG(LogTemp, Log, TEXT("=== SENT: %s ==="), *Message);
+    }
+}
+
+// ※ 테스트 방법:
+// 1. AgentServer 실행: cd AgentServer && dotnet run
+//    → "Lobby DS: NOT RUNNING" 나와도 OK
+// 2. UE 에디터에서 Project Settings > Maps & Modes > Game Instance Class
+//    → ChatTestGameInstance 로 설정
+// 3. PIE 실행 → Output Log에서 로그 확인:
+//    [AgentServer] WebSocket Connected
+//    === LOGIN SUCCESS: TestUser1 ===
+//    === CHAT RECEIVED: [테스터1] Hello from Unreal! ===
+// 4. TestSendChat("아무 메시지") 블루프린트에서 호출해서 추가 테스트
+// 5. PIE 2개 띄우면 서로 채팅 주고받는 것도 확인 가능
